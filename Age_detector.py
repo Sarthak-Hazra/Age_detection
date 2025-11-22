@@ -1,345 +1,360 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-import numpy as np
-from PIL import Image
-from sklearn.model_selection import train_test_split 
-import os
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
-import scipy.io
-from datetime import date, timedelta, datetime
+import os
+from PIL import Image
+import re
+from tqdm import tqdm
 import math
 
-=
+# --- 1. CONFIGURATION ---
+
+# IMPORTANT: Replace this with the exact path to your UTKFace folder.
+# The script will look for image files directly within this directory.
+UTKFACE_DIR = r"C:\Users\Sarthak Hazra\Documents\vscode\age_estimation\UTKFace"
+
+# Training parameters
+# OPTIMIZATION 2: Increased BATCH_SIZE for better GPU utilization
+BATCH_SIZE = 128 
+LEARNING_RATE = 0.001
+NUM_EPOCHS = 20
+VALIDATION_SPLIT = 0.1 # 10% of data for validation
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print(f"Using device: {DEVICE}")
+
+# --- 2. CBAM MODULE IMPLEMENTATION ---
+# # The CBAM module is composed of a Channel Attention Module (CAM) and a Spatial Attention Module (SAM).
 
 class ChannelAttention(nn.Module):
-    def __init__(self, in_channels, reduction_ratio=16):
+    """
+    Channel Attention Module (CAM).
+    It compresses the spatial dimensions and uses MLP to learn the channel relationships.
+    """
+    def __init__(self, in_planes, ratio=16):
         super(ChannelAttention, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
-
-    
+        
+        # Shared MLP: W1(W0(x)) where W0 is the reduction layer
         self.mlp = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // reduction_ratio, 1, bias=False),
+            nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False),
             nn.ReLU(),
-            nn.Conv2d(in_channels // reduction_ratio, in_channels, 1, bias=False)
+            nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
         )
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
         avg_out = self.mlp(self.avg_pool(x))
         max_out = self.mlp(self.max_pool(x))
-        channel_attention = torch.sigmoid(avg_out + max_out)
-        return x * channel_attention.expand_as(x)
+        out = avg_out + max_out
+        return self.sigmoid(out)
 
 class SpatialAttention(nn.Module):
+    """
+    Spatial Attention Module (SAM).
+    It aggregates channel information through max and avg pooling along the channel axis.
+    """
     def __init__(self, kernel_size=7):
         super(SpatialAttention, self).__init__()
-        assert kernel_size in (3, 7),
-        padding = 3 if kernel_size == 7 else 1
-        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+
+        # Concatenate Avg and Max pooled features (2 channels) and apply convolution
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
-        spatial_input = torch.cat([avg_out, max_out], dim=1)
-        spatial_attention = torch.sigmoid(self.conv1(spatial_input))
-        return x * spatial_attention.expand_as(x)
+        x_concat = torch.cat([avg_out, max_out], dim=1)
+        
+        attention_map = self.conv1(x_concat)
+        return self.sigmoid(attention_map)
 
 class CBAM(nn.Module):
-    def __init__(self, in_channels, reduction_ratio=16, kernel_size=7):
+    """
+    Convolutional Block Attention Module (CBAM).
+    Applies Channel Attention followed by Spatial Attention.
+    """
+    def __init__(self, in_planes, ratio=16, kernel_size=7):
         super(CBAM, self).__init__()
-        self.ca = ChannelAttention(in_channels, reduction_ratio)
+        self.ca = ChannelAttention(in_planes, ratio)
         self.sa = SpatialAttention(kernel_size)
 
     def forward(self, x):
-        x = self.ca(x)
-        x = self.sa(x)
+        # 1. Channel Attention
+        ca_weight = self.ca(x)
+        x = x * ca_weight # Element-wise multiplication
+        
+        # 2. Spatial Attention
+        sa_weight = self.sa(x)
+        x = x * sa_weight # Element-wise multiplication
+        
         return x
 
+# --- 3. RESNET-18 WITH CBAM (MODIFIED BASIC BLOCK) ---
 
-class BasicBlock(nn.Module):
+class BasicBlockCBAM(nn.Module):
+    """
+    Basic Block for ResNet-18, modified to include CBAM after the two convolutions.
+    """
     expansion = 1
 
-    def __init__(self, in_channels, out_channels, stride=1, cbam=True):
-        super(BasicBlock, self).__init__()
-        self.cbam = cbam
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlockCBAM, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        
+        # CBAM component
+        self.cbam = CBAM(planes)
 
-        # Main Path
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels * self.expansion, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels * self.expansion)
-
-        if self.cbam:
-            self.attn = CBAM(out_channels * self.expansion)
-
-        # Shortcut (Identity or 1x1 Convolution)
         self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels * self.expansion:
+        if stride != 1 or in_planes != self.expansion * planes:
+            # Shortcut connection to match dimensions if needed
             self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels * self.expansion, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels * self.expansion)
+                nn.Conv2d(in_planes, self.expansion * planes,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion * planes)
             )
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
+        out = nn.ReLU()(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-
-        if self.cbam:
-            out = self.attn(out)
-
+        
+        # Apply CBAM before the final ReLU and shortcut addition
+        out = self.cbam(out)
+        
         out += self.shortcut(x)
-        out = F.relu(out)
+        out = nn.ReLU()(out)
         return out
 
-class CBAMResNet(nn.Module):
-    def __init__(self, block, num_blocks, num_classes=1, img_channels=3):
-        super(CBAMResNet, self).__init__()
-        self.in_channels = 64
-        self.conv1 = nn.Conv2d(img_channels, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
+class ResNet18_CBAM(nn.Module):
+    """
+    ResNet-18 model using the BasicBlockCBAM.
+    The final layer is configured for age regression (1 output).
+    """
+    def __init__(self, block, num_blocks, num_classes=1):
+        super(ResNet18_CBAM, self).__init__()
+        self.in_planes = 64
 
+        # Initial stem
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        
+        # ResNet stages
         self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
         self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
         self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
         self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
-
+        
+        # Global Average Pooling 
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.linear = nn.Linear(512 * block.expansion, num_classes)
 
-    def _make_layer(self, block, out_channels, num_blocks, stride):
-        strides = [stride] + [1] * (num_blocks - 1)
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1]*(num_blocks-1)
         layers = []
-        for stride_val in strides:
-            layers.append(block(self.in_channels, out_channels, stride_val, cbam=True))
-            self.in_channels = out_channels * block.expansion
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-
+        out = nn.ReLU()(self.bn1(self.conv1(x)))
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.layer4(out)
-
-        out = F.avg_pool2d(out, out.size()[3])
-        out = out.view(out.size(0), -1)
-
+        
+        # Global Average Pooling 
+        out = self.avg_pool(out) 
+        
+        out = out.view(out.size(0), -1) # Flatten (Batch, 512, 1, 1) to (Batch, 512)
         out = self.linear(out)
         return out
 
-def CBAM_ResNet18():
-    return CBAMResNet(BasicBlock, [2, 2, 2, 2])
+def ResNet18CBAM():
+    """ Instantiates the ResNet-18 CBAM model. """
+    return ResNet18_CBAM(BasicBlockCBAM, [2, 2, 2, 2])
 
 
-def datenum_to_datetime(datenum):
-    return datetime.fromordinal(int(datenum)) + timedelta(days=datenum % 1) - timedelta(days=366)
+# --- 4. UTKFACE CUSTOM DATASET ---
 
-def calculate_age(photo_date_serial, dob_serial):
-    try:
-        age_in_days = photo_date_serial - dob_serial
-        age = age_in_days / 365.25
-        
-        return float(age)
-    except:
-        return -1.0
-
-
-def load_imdb_wiki_metadata(mat_file_path, image_dir):
-
-    print(f"Loading metadata from: {mat_file_path}")
-    
-    try:
-        mat = scipy.io.loadmat(mat_file_path)
-    except FileNotFoundError:
-        print(f"ERROR: Metadata file not found at {mat_file_path}. Check your path.")
-        return [], []
-    except Exception as e:
-        print(f"ERROR loading .mat file: {e}")
-        return [], []
-
-    data = mat['wiki'][0, 0] if 'wiki' in mat else mat['imdb'][0, 0]
-    
-    # Extract raw data columns
-    photo_taken = data[0][0] # Photo date in serial format
-    full_path = data[2][0]   # Image path relative to the image_dir
-    gender = data[3][0]
-    date_of_birth = data[5][0] # DOB in serial format
-    
-    paths = []
-    ages = []
-    
-    for i in range(len(full_path)):
-        
-        age_val = calculate_age(photo_taken[i], date_of_birth[i])
-        
-       
-        rel_path = str(full_path[i][0])
-        abs_path = os.path.join(image_dir, rel_path)
-
-        
-        if 1.0 <= age_val <= 100.0 and os.path.exists(abs_path):
-            paths.append(abs_path)
-            ages.append(age_val)
-
-    return paths, ages
-
-class CustomImageDataset(Dataset):
-    def __init__(self, image_paths, ages, transform=None):
-        self.image_paths = image_paths
-        self.ages = ages
+class UTKFaceDataset(Dataset):
+    """
+    Custom PyTorch Dataset for the UTKFace dataset.
+    Extracts age label from the image filenames.
+    """
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
         self.transform = transform
+        self.image_files = [f for f in os.listdir(root_dir) if f.endswith('.jpg')]
+        self.file_pattern = re.compile(r'(\d+)_(\d+)_(\d+)_(\d+).jpg')
 
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.image_files)
 
     def __getitem__(self, idx):
-        
-        image_path = self.image_paths[idx]
+        img_name = self.image_files[idx]
+        img_path = os.path.join(self.root_dir, img_name)
         
         try:
-            image = Image.open(image_path).convert('RGB') 
+            image = Image.open(img_path).convert('RGB')
         except Exception as e:
-            
-            print(f"Could not load image {image_path}: {e}")
-            return torch.zeros(3, 224, 224), torch.tensor([30.0], dtype=torch.float32)
+            # Handle corrupted file or read error (e.g., return a placeholder or skip)
+            print(f"Skipping file {img_name} due to error: {e}")
+            # Recursively call __getitem__ with a new index (less than ideal but works)
+            # For a production system, you'd prune the list upfront.
+            new_idx = (idx + 1) % len(self)
+            return self.__getitem__(new_idx)
 
-       
+        # Extract age from filename: [age]_[gender]_[race]_[date&time].jpg
+        match = self.file_pattern.match(img_name)
+        if match:
+            age = int(match.group(1))
+        else:
+            # If parsing fails, use a placeholder and warn
+            print(f"Could not parse age from filename: {img_name}. Using age 0.")
+            age = 0 
+        
+        # Convert age to a float tensor for regression
+        age_label = torch.tensor([float(age)], dtype=torch.float32)
+
         if self.transform:
             image = self.transform(image)
 
+        return image, age_label
+
+# Define transformations: Resizing, converting to tensor, and normalization
+data_transforms = transforms.Compose([
+    # OPTIMIZATION 1: Reduced size from 128x128 to 96x96 to speed up computation
+    transforms.Resize((96, 96)), 
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# --- 5. TRAINING AND VALIDATION FUNCTIONS ---
+
+def train_model(model, train_loader, criterion, optimizer):
+    """Performs one epoch of training."""
+    model.train()
+    running_loss = 0.0
+    for inputs, labels in tqdm(train_loader, desc="Training"):
+        inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+
+        optimizer.zero_grad()
         
-        age = torch.tensor(self.ages[idx], dtype=torch.float32).unsqueeze(0) 
+        # Forward pass
+        outputs = model(inputs)
+        loss = criterion(outputs, labels) # MAE (L1 Loss) is common for age regression
         
-        return image, age
-
-def get_data_loaders(mat_file_path, image_dir, batch_size=32, val_split=0.1):
+        # Backward pass and optimization
+        loss.backward()
+        optimizer.step()
+        
+        running_loss += loss.item() * inputs.size(0)
     
-    all_paths, all_ages = load_imdb_wiki_metadata(mat_file_path, image_dir)
-    
-    if not all_paths:
-        print("ERROR: No valid data loaded. Check paths and dataset integrity.")
-        return None, None
+    epoch_loss = running_loss / len(train_loader.dataset)
+    return epoch_loss
 
-
-    train_paths, val_paths, train_ages, val_ages = train_test_split(
-        all_paths, all_ages, test_size=val_split, random_state=42
-    )
-
-    print(f"Total valid samples: {len(all_paths)}")
-    print(f"Training samples: {len(train_paths)}")
-    print(f"Validation samples: {len(val_paths)}")
-
-    train_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.RandomCrop(224, padding=4), # Added common regularization technique
-        transforms.RandomHorizontalFlip(), 
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    val_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
-    train_dataset = CustomImageDataset(train_paths, train_ages, transform=train_transform)
-    val_dataset = CustomImageDataset(val_paths, val_ages, transform=val_transform)
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4) # Increased workers
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4) # Increased workers
-
-    return train_loader, val_loader
-
-
-def calculate_mae(outputs, targets):
-    return torch.mean(torch.abs(outputs - targets))
-
-def validate_model(model, val_loader, device):
-    """Evaluates the model on the validation set and returns the MAE."""
-    model.eval() 
+def validate_model(model, val_loader, criterion):
+    """Performs validation and returns Mean Absolute Error (MAE) and loss."""
+    model.eval()
+    running_loss = 0.0
     total_mae = 0.0
-    total_samples = 0
-    with torch.no_grad(): 
-        for inputs, targets in val_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
+    
+    with torch.no_grad():
+        for inputs, labels in tqdm(val_loader, desc="Validation"):
+            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
             
-            mae = calculate_mae(outputs, targets)
-            total_mae += mae.item() * inputs.size(0)
-            total_samples += inputs.size(0)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            
+            running_loss += loss.item() * inputs.size(0)
+            
+            # Calculate Mean Absolute Error (MAE)
+            # Age prediction is rounded to the nearest integer
+            abs_error = torch.abs(outputs - labels)
+            total_mae += torch.sum(abs_error).item()
+    
+    epoch_loss = running_loss / len(val_loader.dataset)
+    epoch_mae = total_mae / len(val_loader.dataset)
+    return epoch_loss, epoch_mae
 
-    avg_mae = total_mae / total_samples
-    model.train() 
-    return avg_mae
+
+# --- 6. MAIN EXECUTION ---
 
 def main():
-
-    IMDB_WIKI_MAT_PATH = "./imdb_crop/imdb.mat" #put the path to the matlab file
-    IMDB_WIKI_IMAGE_DIR = "./imdb_crop/" # put the path to the image files
+    # 1. Load Data
+    full_dataset = UTKFaceDataset(root_dir=UTKFACE_DIR, transform=data_transforms)
     
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
-    
-    epochs = 50 
-    batch_size = 64
-    learning_rate = 0.001
+    if len(full_dataset) == 0:
+        print(f"Error: No images found in the directory: {UTKFACE_DIR}")
+        print("Please check the UTKFACE_DIR path and ensure the folder contains JPG image files.")
+        return
 
+    # Split dataset into training and validation sets
+    val_size = int(VALIDATION_SPLIT * len(full_dataset))
+    train_size = len(full_dataset) - val_size
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
-    model = CBAM_ResNet18().to(device)
-    train_loader, val_loader = get_data_loaders(
-        IMDB_WIKI_MAT_PATH, IMDB_WIKI_IMAGE_DIR, batch_size=batch_size
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=4,
+        pin_memory=(DEVICE.type == 'cuda') # OPTIMIZATION 3: Pin memory for faster GPU transfer
     )
-    
-    if train_loader is None or val_loader is None:
-        return 
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=(DEVICE.type == 'cuda') # OPTIMIZATION 3: Pin memory for faster GPU transfer
+    )
 
-    print("Model initialized: CBAM-ResNet-18 for Age Regression")
-
+    print(f"Total dataset size: {len(full_dataset)}")
+    print(f"Training set size: {len(train_dataset)}")
+    print(f"Validation set size: {len(val_dataset)}")
     
+    # 2. Initialize Model, Loss, and Optimizer
+    model = ResNet18CBAM().to(DEVICE)
+    
+    # For age regression, L1Loss (MAE) is a good choice as it penalizes errors linearly.
     criterion = nn.L1Loss() 
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
-    
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
-
-   
     best_val_mae = float('inf')
-    
-    for epoch in range(epochs):
-        running_loss = 0.0
-        model.train()
+
+    # 3. Training Loop
+    print("\nStarting training...\n")
+    for epoch in range(NUM_EPOCHS):
+        print(f"--- Epoch {epoch+1}/{NUM_EPOCHS} ---")
         
-        for i, (inputs, targets) in enumerate(train_loader):
-            inputs, targets = inputs.to(device), targets.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets) 
-
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-
-       
-        scheduler.step()
-
-       
-        val_mae = validate_model(model, val_loader, device)
-
-        avg_loss = running_loss / len(train_loader)
-        print(f'Epoch [{epoch+1}/{epochs}] | Train MAE (Loss): {avg_loss:.4f} | Val MAE: {val_mae:.4f}')
-
+        # Train
+        train_loss = train_model(model, train_loader, criterion, optimizer)
         
+        # Validate
+        val_loss, val_mae = validate_model(model, val_loader, criterion)
+        
+        print(f"  Train Loss: {train_loss:.4f}")
+        print(f"  Validation Loss: {val_loss:.4f} | Validation MAE: {val_mae:.2f}")
+        
+        # Save the best model based on validation MAE
         if val_mae < best_val_mae:
             best_val_mae = val_mae
-            print(f'*** Saving best model with Val MAE: {best_val_mae:.4f} ***')
-            torch.save(model.state_dict(), 'best_cbam_age_detector.pth')
+            checkpoint_path = 'best_age_estimator_cbam.pth'
+            torch.save(model.state_dict(), checkpoint_path)
+            print(f"  --> Saved best model to {checkpoint_path} with MAE: {best_val_mae:.2f}")
 
-    print('\nTraining complete.')
+    print("\nTraining complete.")
+    print(f"Best Validation MAE achieved: {best_val_mae:.2f} years")
 
 if __name__ == '__main__':
     main()
